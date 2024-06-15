@@ -2,12 +2,15 @@ package plugins
 
 import (
 	"context"
-	"log"
+	"encoding/json"
 	"fmt"
+	"log"
+	"math"
+	"strconv"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"encoding/json"
 )
 
 type CustomSchedulerArgs struct {
@@ -60,15 +63,34 @@ func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 // filter the pod if the pod in group is less than minAvailable
 func (cs *CustomScheduler) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	log.Printf("Pod %s is in Prefilter phase.", pod.Name)
-	newStatus := framework.NewStatus(framework.Success, "")
 
 	// TODO
 	// 1. extract the label of the pod
-	// 2. retrieve the pod with the same group label
-	// 3. justify if the pod can be scheduled
+	group, groupExists := pod.Labels[groupNameLabel]
+	minAvailableStr, minAvailableExists := pod.Labels[minAvailableLabel]
+	if !groupExists || !minAvailableExists {
+		return nil, framework.NewStatus(framework.Error, "Invalid label.")
+	}
+	minAvailable, err := strconv.Atoi(minAvailableStr)
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, "Invalid minAvailable value.")
+	}
 
-	return nil, newStatus
+	// 2. retrieve the pod with the same group label
+	selector := labels.SelectorFromSet(labels.Set{groupNameLabel: group})
+	pods, err := cs.handle.SharedInformerFactory().Core().V1().Pods().Lister().List(selector)
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, fmt.Sprintf("Error listing pods.: %v.", err))
+	}
+
+	// 3. justify if the pod can be scheduled
+	if len(pods) < minAvailable {
+		return nil, framework.NewStatus(framework.Unschedulable, "Not enough pods in the group.")
+	}
+
+	return nil, framework.NewStatus(framework.Success, "")
 }
+
 
 // PreFilterExtensions returns a PreFilterExtensions interface if the plugin implements one.
 func (cs *CustomScheduler) PreFilterExtensions() framework.PreFilterExtensions {
@@ -82,18 +104,53 @@ func (cs *CustomScheduler) Score(ctx context.Context, state *framework.CycleStat
 
 	// TODO
 	// 1. retrieve the node allocatable memory
+	nodeInfo, err := cs.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("Error getting node info: %v", err))
+	}
+	memory := nodeInfo.Allocatable.Memory
+
 	// 2. return the score based on the scheduler mode
-	
-	return 0, nil
+	score := int64(0)
+	if cs.scoreMode == leastMode {
+		score = -memory
+	} else if cs.scoreMode == mostMode {
+		score = memory
+	}
+
+	return score, framework.NewStatus(framework.Success, "")
 }
+
 
 // ensure the scores are within the valid range
 func (cs *CustomScheduler) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
 	// TODO
 	// find the range of the current score and map to the valid range
+	minScore := int64(math.MaxInt64)
+	maxScore := int64(math.MinInt64)
+	for _, score := range scores {
+		if score.Score < minScore {
+			minScore = score.Score
+		}
+		if score.Score > maxScore {
+			maxScore = score.Score
+		}
+	}
 
-	return nil
+	rangeScore := maxScore - minScore
+	if rangeScore == 0 {
+		for i := range scores {
+			scores[i].Score = framework.MinNodeScore + (framework.MaxNodeScore - framework.MinNodeScore) / 2
+		}
+	} else {
+		for i := range scores {
+			scores[i].Score = framework.MinNodeScore + (scores[i].Score - minScore) * (framework.MaxNodeScore - framework.MinNodeScore) / rangeScore
+		}
+	}
+
+	return framework.NewStatus(framework.Success, "")
 }
+
 
 // ScoreExtensions of the Score plugin.
 func (cs *CustomScheduler) ScoreExtensions() framework.ScoreExtensions {
